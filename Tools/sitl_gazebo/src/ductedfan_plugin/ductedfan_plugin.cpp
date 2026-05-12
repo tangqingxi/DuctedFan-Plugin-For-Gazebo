@@ -82,6 +82,12 @@ void DuctedFanModel::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf) {
   if (link_ == NULL)
     gzthrow("[ductedfan_plugin model] Couldn't find specified link \"" << link_name_ << "\".");
 
+  // 获取机体基准连杆（通常为 base_link），用于后续施加力和读取状态
+  base_link_ = model_->GetLink("base_link");
+  if (!base_link_) {
+    gzerr << "[ductedfan_plugin] 无法找到 base_link，机体气动力和力矩将无法施加！\n";
+  }
+
   // 电机编号
   if (_sdf->HasElement("motorNumber"))
     motor_number_ = _sdf->GetElement("motorNumber")->Get<int>();
@@ -169,6 +175,15 @@ void DuctedFanModel::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf) {
   getSdfParam<double>(_sdf, "sideForceArmZ", l_cpz_, 0.0);
   getSdfParam<double>(_sdf, "thrustCenterOffsetCoeff", k_cpx_, 0.0);
 
+  getSdfParam<double>(_sdf, "ductExpansionRatio", duct_sd_, 0.7);
+  getSdfParam<double>(_sdf, "ductDiskArea", duct_S_, M_PI * 0.114 * 0.114);
+  getSdfParam<double>(_sdf, "airDensity", air_density_, 1.225);
+  
+  getSdfParam<double>(_sdf, "pitchDampingConstant", k_my0_, 0.0);      
+  getSdfParam<double>(_sdf, "pitchDampingVelocityCoeff", k_myv_, 0.0); 
+
+  getSdfParam<double>(_sdf, "ductTorqueCoeff", k_sta_, 0.0);
+  getSdfParam<double>(_sdf, "fanInertia", I_fan_, 0.0);
 
   fly = false;  // 某个未使用的标志
 
@@ -258,31 +273,45 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   double real_motor_velocity = motor_rot_vel_ * rotor_velocity_slowdown_sim_;  //风扇转速O
   double O = real_motor_velocity;
 
-  // 获取旋翼刚体在世界坐标系下的线速度
+  // 获取机体基准连杆在世界坐标系下的线速度与姿态
 #if GAZEBO_MAJOR_VERSION >= 9
-  ignition::math::Vector3d body_velocity = link_->WorldLinearVel();
-  ignition::math::Vector3d joint_axis = joint_->GlobalAxis(0);
-  ignition::math::Pose3d link_pose = link_->WorldPose();
+  ignition::math::Vector3d body_velocity = base_link_->WorldLinearVel();
+  ignition::math::Pose3d link_pose = base_link_->WorldPose();  // 机体姿态
 #else
-  ignition::math::Vector3d body_velocity = ignitionFromGazeboMath(link_->GetWorldLinearVel());
-  ignition::math::Vector3d joint_axis = ignitionFromGazeboMath(joint_->GetGlobalAxis(0));
-  ignition::math::Pose3d link_pose = ignitionFromGazeboMath(link_->GetWorldPose());
+  ignition::math::Vector3d body_velocity = ignitionFromGazeboMath(base_link_->GetWorldLinearVel());
+  ignition::math::Pose3d link_pose = ignitionFromGazeboMath(base_link_->GetWorldPose());
 #endif
 
-  // 计算相对风速 = 机体速度 - 世界风速
+  // 计算相对风速（世界系 -> 机体 ENU 局部系）
   ignition::math::Vector3d relative_wind_velocity = body_velocity - wind_vel_;
-  // 机体系下的相对风速（旋翼坐标系下的风速）Va = Rn2b*[ (Vx - Dx) ; (Vy - Dy) ; (Vz - Dz) ];
-  ignition::math::Vector3d wind_body = link_pose.Rot().RotateVectorReverse(relative_wind_velocity); 
+  ignition::math::Vector3d wind_body = link_pose.Rot().RotateVectorReverse(relative_wind_velocity);
+
+  // 获取机体角速度（世界系 -> 机体系）
+#if GAZEBO_MAJOR_VERSION >= 9
+  ignition::math::Vector3d ang_vel_world = base_link_->WorldAngularVel();
+#else
+  ignition::math::Vector3d ang_vel_world = ignitionFromGazeboMath(base_link_->GetWorldAngularVel());
+#endif
+  ignition::math::Vector3d ang_vel = link_pose.Rot().RotateVectorReverse(ang_vel_world);
+  
   // （ENU坐标系下的Va速度）
   
   double u_enu = wind_body.X();   // 本体前向x
   double v_enu = wind_body.Y();   // 本体侧向y
   double w_enu = wind_body.Z();   // 本体轴向z (z向上为正)
-  
+
+  double p_enu = ang_vel.X();   // 滚转角速度
+  double q_enu = ang_vel.Y();   // 俯仰   
+  double r_enu = ang_vel.Z();   // 偏航
+
   //  转换为 MATLAB 坐标系（x→v, y→u, z→-w）
   double u_mat = v_enu;   //侧向 x
   double v_mat = u_enu;   //前向 y
   double w_mat = -w_enu;  //轴向 z(z轴向下为正)
+
+  double p_mat = q_enu;   // 滚转角速度
+  double q_mat = p_enu;   // 俯仰角速度
+  double r_mat = -r_enu;  // 偏航角速度
 
   //--------------------------------------------------------
     //空速、迎角（机体）
@@ -307,7 +336,7 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   //--------------------------------------------------------
 
 
-  // =================Ducted_Fan_FnM函数部分=====================
+  // =================Ducted_Fan_FnM函数=====================
   // 输入：转速 O，来流速度分量 u_mat, v_mat, w_mat
   // 输出：推力 Ducted_T，侧向力 Ducted_N，俯仰力矩 Ducted_M，反扭矩 Ducted_Q
   
@@ -336,7 +365,7 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   if (!spline_dt_.empty()) dt = PpvalSpline(spline_dt_, Ducted_AOA, true);
   if (!spline_dn_.empty()) dn = PpvalSpline(spline_dn_, Ducted_AOA, true);
 
-  // ========== 力与力矩计算===================
+  // ========== 涵道力与力矩计算===================
   double Ducted_O2  = O * O;
   double Ducted_VaO = Ducted_Va_body * O;
 
@@ -364,13 +393,8 @@ void DuctedFanModel::UpdateForcesAndMoments() {
  // 反扭矩 Q (MATLAB y(4))，绕旋转轴（z 轴）
   double Ducted_Q = moment_constant_ * Ducted_O2;   // moment_constant_ 即 k_Q0
   
-  
-  
-  // =================Ducted_Fan_FnM函数部分=====================
 
-
-
-  // =================Wing_FnM函数部分===========================
+  // =================Wing_FnM函数===========================
   // 机翼样条插值
   double wl = 0.0, wd = 0.0, wm = 0.0;
   if (!wing_spline_wl_.empty()) wl = PpvalSpline(wing_spline_wl_, AOA, true);
@@ -381,9 +405,70 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   double Wing_Fy = Vvw2 * wl;   // 力在MATLAB的前向 y 轴分量
   double Wing_Fz = Vvw2 * wd;   // 力在MATLAB的轴向 z 轴分量 (向下为正)
   double Wing_My = Vvw2 * wm;   // 力矩绕MATLAB的侧向 x 轴
-// =================Wing_FnM函数部分===========================
+ 
 
+  // =================计算力与力矩部分===========================
 
+  double Ve = -w_mat / 2.0 + std::sqrt( (w_mat/2.0)*(w_mat/2.0) + Ducted_T / (duct_sd_ * air_density_ * duct_S_) );
+  double F1 = -Ducted_N * Sduct;
+  double F2 = -Ducted_N * Cduct + -Wing_Fy;
+  double F3 = -Ducted_T + -Wing_Fz;
+
+  // 构建 MATLAB 坐标系下的合力矢量 (y前向,x侧向,z向下)
+  ignition::math::Vector3d F_mat(F1, F2, F3);
+
+  // 非轴流阻尼力矩 M_my (绕 MATLAB x 轴)
+  double M_my = -p_mat * (k_my0_ + k_myv_ * Vvw_mat);
+
+  // 风扇扭矩 M_fan (绕 MATLAB z 轴)  注意: y1(4) 即 Ducted_Q
+  double M_fan = -turning_direction_ * Ducted_Q;  // Dir 理解为 turning_direction_
+
+  // 涵道反扭矩 M_sta (绕 MATLAB z 轴)
+  double M_sta = turning_direction_ * k_sta_ * Ve * Ve;
+
+  // 陀螺力矩 M_gyro (矢量)
+  double M_gyro_x = -I_fan_ * O * q_mat;   // 绕 x
+  double M_gyro_y =  I_fan_ * O * p_mat;   // 绕 y
+  double M_gyro_z = 0.0;                   // 绕 z (通常为0)
+  //  合成总力矩 M_aero (MATLAB 坐标系) 
+  double M1 = -Ducted_M * Cduct - Wing_My + M_my + M_gyro_x;
+  double M2 =  Ducted_M * Sduct + M_gyro_y;
+  double M3 =  M_fan + M_sta + M_gyro_z;
+
+  // 构建 MATLAB 坐标系下的力矩矢量 (y前向,x侧向,z向下)
+  ignition::math::Vector3d M_mat(M1, M2, M3);
+
+  // 转换到 Gazebo ENU 坐标系
+  ignition::math::Vector3d F_enu(F_mat.Y(), F_mat.X(), -F_mat.Z());
+  ignition::math::Vector3d M_enu(M_mat.Y(), M_mat.X(), -M_mat.Z());
+  
+  
+  
+  // ================= 施加力与力矩到 base_link =================
+
+  if (base_link_) {
+    base_link_->AddRelativeForce(F_enu);    // 相对机体坐标系施加合力
+    base_link_->AddRelativeTorque(M_enu);   // 相对机体坐标系施加合力矩
+  }
+  
+  // ================= 速度控制（设定关节速度） =================
+  double ref_motor_rot_vel;
+  ref_motor_rot_vel = rotor_velocity_filter_->updateFilter(ref_motor_rot_vel_, sampling_time_);
+  
+  // PID 模式被屏蔽，通常直接设置关节速度（近似忽略电机瞬态响应，实际已由滤波器处理）
+#if 0 //FIXME: disable PID for now, it does not play nice with the PX4 CI system.
+  if (use_pid_) {
+    double err = joint_->GetVelocity(0) - turning_direction_ * ref_motor_rot_vel / rotor_velocity_slowdown_sim_;
+    double rotorForce = pid_.Update(err, sampling_time_);
+    joint_->SetForce(0, rotorForce);
+  } else {
+    // Gazebo 7+ 直接设置速度
+    joint_->SetVelocity(0, turning_direction_ * ref_motor_rot_vel / rotor_velocity_slowdown_sim_);
+  }
+#else
+  // 最终关节速度 = 旋转方向 * 滤波后转速 / 仿真减速比
+  joint_->SetVelocity(0, turning_direction_ * ref_motor_rot_vel / rotor_velocity_slowdown_sim_);
+#endif
 
 
   // ================= 调试打印部分 =========================
@@ -400,15 +485,18 @@ void DuctedFanModel::UpdateForcesAndMoments() {
     // 设定间隔阈值：1000 毫秒 (1秒)
     if (elapsed_ms >= 1000) {
         std::cout << "--- Debug Info [Motor " << motor_number_ << "] ---" << std::endl;
-        std::cout << "motor_rot_vel_: " << motor_rot_vel_ << "\n"
-          << "real_motor_velocity: " << real_motor_velocity << "\n"
+        std::cout << "real_motor_velocity: " << real_motor_velocity << "\n"
           << "AOA(deg): " << AOA * 180.0 / M_PI
           << " wl:" << wl << " wd:" << wd << " wm:" << wm << "\n"
           << "Ducted_AOA(deg): " << Ducted_AOA * 180.0 / M_PI
           << " dt:" << dt << " dn:" << dn << "\n"
           << "Ducted_T: " << Ducted_T << " Ducted_N: " << Ducted_N
-          << " Ducted_M: " << Ducted_M << " Ducted_Q: " << Ducted_Q << "\n"
-          << "Wing_Fy: " << Wing_Fy << " Wing_Fz: " << Wing_Fz << " Wing_My: " << Wing_My << std::endl;
+          << "Ducted_M: " << Ducted_M << " Ducted_Q: " << Ducted_Q << "\n"
+          << "Ve: " << Ve << " m/s\n"
+          << "p_mat:" << p_mat << " q_mat:" << q_mat << " r_mat:" << r_mat << "\n"
+          << "M_my:" << M_my << " M_fan:" << M_fan << " M_sta:" << M_sta << "\n"
+          << "M_total(enu): " << M_enu << "\n"
+          << "F_enu: " << F_enu << std::endl;
         std::cout << "----------------------------------" << std::endl;
 
         // 更新时间戳

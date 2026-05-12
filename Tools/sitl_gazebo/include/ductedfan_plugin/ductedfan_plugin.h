@@ -148,6 +148,16 @@ class DuctedFanModel : public MotorModel, public ModelPlugin {
   double l_cpz_;       // sideForceArmZ
   double k_cpx_;       // thrustCenterOffsetCoeff
 
+  double duct_sd_;   // 涵道扩压比
+  double duct_S_;    // 桨盘面积
+  double air_density_; // 空气密度
+
+  double k_my0_;   // 俯仰阻尼常数项
+  double k_myv_;   // 俯仰阻尼速度项系数
+
+  double k_sta_;   // 涵道反扭矩系数
+  double I_fan_;   // 风扇转动惯量
+
   std::vector<SplineSegment> spline_dt_;    // 涵道拉力系数样条
   std::vector<SplineSegment> spline_dn_;    // 涵道侧向力系数样条
   
@@ -169,6 +179,9 @@ class DuctedFanModel : public MotorModel, public ModelPlugin {
   common::PID pid_;                // 速度闭环 PID 控制器（如果启用）
   bool use_pid_;                   // 是否使用 PID 控制关节力来跟踪转速
   physics::LinkPtr link_;          // 旋翼刚体的指针
+
+  physics::LinkPtr base_link_;   // 机体基准连杆，用于读取运动状态和施加合力
+  
   /// Gazebo 事件连接（用于更新回调）
   event::ConnectionPtr updateConnection_;
 
