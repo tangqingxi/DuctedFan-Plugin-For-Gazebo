@@ -17,7 +17,7 @@ ductedfan_plugin_05.md
 
 ---
 
-## 1. 环境要求(跳转到https://github.com/mengchaoheng/DuctedFanUAV-Autopilot搭建环境)
+## 1. 环境要求(跳转到https://github.com/mengchaoheng/DuctedFanUAV-Autopilot)搭建环境
 - 对于Ubuntu 20.04，安装模拟环境相当简单：
 - 安装git：
 ```bash
