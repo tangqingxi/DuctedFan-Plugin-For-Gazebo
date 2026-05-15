@@ -1,6 +1,7 @@
 
 #include "ductedfan_plugin/ductedfan_plugin.h" //ductedfan_plugin/ductedfan_plugin.h实际上用的这个
 #include <ignition/math.hh>  // Ignition Math 数学库，提供 Vector3、Pose3 等
+#include <sstream>   // 用于解析 SDF 中的矩阵字符串
 #include "ductedfan_plugin/spline_ppval.h" // 包含样条插值相关的定义和PpvalSpline函数
 
 // 以下两个为测试时打印变量使用的头文件，以后可以直接删去==
@@ -94,7 +95,7 @@ void DuctedFanModel::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf) {
   else
     gzerr << "[ductedfan_plugin model] Please specify a motorNumber.\n";
 
-  // 旋转方向
+  // 旋翼旋转方向
   if (_sdf->HasElement("turningDirection")) {
     std::string turning_direction = _sdf->GetElement("turningDirection")->Get<std::string>();
     if (turning_direction == "cw")
@@ -107,7 +108,7 @@ void DuctedFanModel::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf) {
     gzerr << "[ductedfan_plugin model] Please specify a turning direction ('cw' or 'ccw').\n";
   }
 
-  // 是否允许反转
+  // 是否允许旋翼反转
   if(_sdf->HasElement("reversible")) {
     reversible_ = _sdf->GetElement("reversible")->Get<bool>();
   }
@@ -155,6 +156,12 @@ void DuctedFanModel::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf) {
       gzerr << "[ductedfan_plugin] 未指定 wingSplineWmFile\n";
   }
 
+  // 读取 1 到 6 号控制舵面关节
+  LoadControlJoints(_sdf);
+
+  // 读取控制舵面分配矩阵 B_cs_
+  LoadControlEffectivenessMatrix(_sdf);
+
   // ---------- 使用 common.h 中的辅助函数读取可选参数 ----------
   getSdfParam<std::string>(_sdf, "commandSubTopic", command_sub_topic_, command_sub_topic_);
   getSdfParam<std::string>(_sdf, "motorSpeedPubTopic", motor_speed_pub_topic_, motor_speed_pub_topic_);
@@ -185,6 +192,11 @@ void DuctedFanModel::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf) {
   getSdfParam<double>(_sdf, "ductTorqueCoeff", k_sta_, 0.0);
   getSdfParam<double>(_sdf, "fanInertia", I_fan_, 0.0);
 
+  // 读取控制舵面力矩模型参数
+  getSdfParam<double>(_sdf, "control_surface_force_coeff", d_cs_, 0.0);
+  getSdfParam<double>(_sdf, "control_surface_arm_l1", l1_cs_, 0.0);
+  getSdfParam<double>(_sdf, "control_surface_arm_l2", l2_cs_, 0.0);
+
   fly = false;  // 某个未使用的标志
 
   // 在 Gazebo 5 以前的版本，设置关节最大力（以后版本不再使用此接口）
@@ -212,6 +224,91 @@ void DuctedFanModel::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf) {
 
   // 初始化一阶滤波器：使用加速/减速时间常数，初始参考转速为0
   rotor_velocity_filter_.reset(new FirstOrderFilter<double>(time_constant_up_, time_constant_down_, ref_motor_rot_vel_));
+}
+
+
+
+// 读取控制舵面关节名称并获取关节指针
+void DuctedFanModel::LoadControlJoints(sdf::ElementPtr _sdf)
+{
+  for (int i = 1; i <= kControlJointCount; ++i) {
+    std::string sdf_tag = "control_joint_name_" + std::to_string(i);
+
+    if (!_sdf->HasElement(sdf_tag)) {
+      gzerr << "[ductedfan_plugin] 未设置 " << sdf_tag
+            << "，CS" << i << " 角度默认为 0。\n";
+      continue;
+    }
+
+    std::string joint_name = _sdf->Get<std::string>(sdf_tag);
+    physics::JointPtr joint = model_->GetJoint(joint_name);
+
+    if (!joint) {
+      gzerr << "[ductedfan_plugin] 无法找到控制舵面关节: "
+            << joint_name << "\n";
+      continue;
+    }
+
+    control_joint_names_[i] = joint_name;
+    control_joints_[i] = joint;
+    control_joint_angles_[i] = 0.0;
+
+    gzmsg << "[ductedfan_plugin] 已加载控制舵面关节 CS"
+          << i << ": " << joint_name << "\n";
+  }
+}
+// 读取 1 到 6 号控制舵面当前角度
+void DuctedFanModel::ReadControlJointAngles()
+{
+  for (int i = 1; i <= kControlJointCount; ++i) {
+    if (!control_joints_[i]) {
+      control_joint_angles_[i] = 0.0;
+      continue;
+    }
+
+#if GAZEBO_MAJOR_VERSION >= 9
+    control_joint_angles_[i] = control_joints_[i]->Position(0);
+#else
+    control_joint_angles_[i] = control_joints_[i]->GetAngle(0).Radian();
+#endif
+  }
+}
+// 从 SDF 读取控制舵面分配矩阵 B_cs_，维度为 3 x 6
+void DuctedFanModel::LoadControlEffectivenessMatrix(sdf::ElementPtr _sdf)
+{
+  if (!_sdf->HasElement("control_effectiveness_matrix")) {
+    gzerr << "[ductedfan_plugin] 未设置 control_effectiveness_matrix，B_cs_ 使用零矩阵。\n";
+    B_cs_.setZero();
+    return;
+  }
+
+  std::string matrix_str = _sdf->GetElement("control_effectiveness_matrix")->Get<std::string>();
+  std::stringstream ss(matrix_str);
+
+  std::vector<double> values;
+  double value = 0.0;
+
+  while (ss >> value) {
+    values.push_back(value);
+  }
+
+  if (values.size() != 18) {
+    gzerr << "[ductedfan_plugin] control_effectiveness_matrix 参数数量错误，应为 18 个，实际为 "
+          << values.size() << " 个。B_cs_ 使用零矩阵。\n";
+    B_cs_.setZero();
+    return;
+  }
+
+  int index = 0;
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 6; ++col) {
+      B_cs_(row, col) = values[index];
+      ++index;
+    }
+  }
+
+  gzmsg << "[ductedfan_plugin] 控制舵面分配矩阵 B_cs_ 读取完成：\n"
+        << B_cs_ << "\n";
 }
 
 // ======== 以下为各种回调 ========
@@ -263,6 +360,9 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   // 获取当前关节角速度（rad/s）
   motor_rot_vel_ = joint_->GetVelocity(0);
 
+  // 读取 1 到 6 号控制舵面当前角度，单位 rad
+  ReadControlJointAngles();
+
   // 检查混叠风险：如果仿真步长太大导致转速过高，可能无法准确捕捉旋转
   if (motor_rot_vel_ / (2 * M_PI) > 1 / (2 * sampling_time_)) {
     gzerr << "Aliasing on motor [" << motor_number_
@@ -293,7 +393,15 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   ignition::math::Vector3d ang_vel_world = ignitionFromGazeboMath(base_link_->GetWorldAngularVel());
 #endif
   ignition::math::Vector3d ang_vel = link_pose.Rot().RotateVectorReverse(ang_vel_world);
-  
+
+  // 读取gazebo中控制舵面角度 CS1 到 CS6（单位 rad）
+  double CS1_gazebo = control_joint_angles_[1];
+  double CS2_gazebo = control_joint_angles_[2];
+  double CS3_gazebo = control_joint_angles_[3];
+  double CS4_gazebo = control_joint_angles_[4];
+  double CS5_gazebo = control_joint_angles_[5];
+  double CS6_gazebo = control_joint_angles_[6];
+
   // （ENU坐标系下的Va速度）
   
   double u_enu = wind_body.X();   // 本体前向x
@@ -305,13 +413,32 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   double r_enu = ang_vel.Z();   // 偏航
 
   //  转换为 MATLAB 坐标系（x→v, y→u, z→-w）
-  double u_mat = v_enu;   //侧向 x
-  double v_mat = u_enu;   //前向 y
+  double u_mat =  v_enu;   //侧向 x
+  double v_mat =  u_enu;   //前向 y
   double w_mat = -w_enu;  //轴向 z(z轴向下为正)
 
-  double p_mat = q_enu;   // 滚转角速度
-  double q_mat = p_enu;   // 俯仰角速度
+  double p_mat =  q_enu;   // 滚转角速度
+  double q_mat =  p_enu;   // 俯仰角速度
   double r_mat = -r_enu;  // 偏航角速度
+
+  // 控制舵面角度在 MATLAB 坐标系下的重新排列（根据论文中定义的 CS1-CS6 与 Gazebo 中控制舵面对应关系）
+  // Gazebo中 CS1由中心向外的黄色射线为机头朝向。俯视图中，CS1-CS6依次顺时针排列。
+  // matlab中 CS1由中心向外的黄色射线为机头朝向。俯视图中，CS1-CS6依次逆时针排列。所以要做如下重新排列：
+  double CS1_mat = CS1_gazebo;
+  double CS2_mat = CS6_gazebo;
+  double CS3_mat = CS5_gazebo;
+  double CS4_mat = CS4_gazebo;
+  double CS5_mat = CS3_gazebo;
+  double CS6_mat = CS2_gazebo;
+  
+  // 构造 MATLAB 坐标系下的控制舵面角度向量，单位 rad
+  Eigen::Matrix<double, 6, 1> c_cs;
+  c_cs << CS1_mat,
+        CS2_mat,
+        CS3_mat,
+        CS4_mat,
+        CS5_mat,
+        CS6_mat;
 
   //--------------------------------------------------------
     //空速、迎角（机体）
@@ -370,7 +497,7 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   double Ducted_VaO = Ducted_Va_body * O;
 
   // 推力 T (MATLAB y(1))，沿机体 z 轴（注意：Gazebo 中转子局部 z 轴向上）
-  double Ducted_T = motor_constant_ * Ducted_O2                     // k_T0 * ω²
+  double Ducted_T =  motor_constant_ * Ducted_O2                     // k_T0 * ω²
            + Ducted_VaO * (k_Th_ + k_Ts_ * Ducted_csAOA)           // 速度‑迎角耦合项
            + Ducted_Va_body * Ducted_Va_body * dt;                 // 纯气动项
 
@@ -414,6 +541,10 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   double F2 = -Ducted_N * Cduct + -Wing_Fy;
   double F3 = -Ducted_T + -Wing_Fz;
 
+  // double F1 = 0.0;
+  // double F2 = 0.0;
+  // double F3 = -Ducted_T;
+
   // 构建 MATLAB 坐标系下的合力矢量 (y前向,x侧向,z向下)
   ignition::math::Vector3d F_mat(F1, F2, F3);
 
@@ -430,25 +561,35 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   double M_gyro_x = -I_fan_ * O * q_mat;   // 绕 x
   double M_gyro_y =  I_fan_ * O * p_mat;   // 绕 y
   double M_gyro_z = 0.0;                   // 绕 z (通常为0)
+
+  // 控制舵面力臂矩阵 diag([l1, l1, l2])
+  Eigen::Matrix3d L_cs = Eigen::Matrix3d::Zero();
+  L_cs(0, 0) = l1_cs_;
+  L_cs(1, 1) = l1_cs_;
+  L_cs(2, 2) = l2_cs_;
+
+  // 控制舵面力矩项：M_cs = d_cs * Ve^2 * diag([l1,l1,l2]) * B * c
+  Eigen::Matrix<double, 3, 1> M_cs =
+      d_cs_ * Ve * Ve * L_cs * B_cs_ * c_cs;
+
   //  合成总力矩 M_aero (MATLAB 坐标系) 
-  double M1 = -Ducted_M * Cduct - Wing_My + M_my + M_gyro_x;
-  double M2 =  Ducted_M * Sduct + M_gyro_y;
-  double M3 =  M_fan + M_sta + M_gyro_z;
+  double M1 = -Ducted_M * Cduct - Wing_My + M_my + M_gyro_x + M_cs(0);
+  double M2 =  Ducted_M * Sduct + M_gyro_y + M_cs(1);
+  double M3 =  (M_fan + M_sta + M_gyro_z + M_cs(2));
 
   // 构建 MATLAB 坐标系下的力矩矢量 (y前向,x侧向,z向下)
   ignition::math::Vector3d M_mat(M1, M2, M3);
 
-  // 转换到 Gazebo ENU 坐标系
-  ignition::math::Vector3d F_enu(F_mat.Y(), F_mat.X(), -F_mat.Z());
-  ignition::math::Vector3d M_enu(M_mat.Y(), M_mat.X(), -M_mat.Z());
-  
+  // 转换到 Gazebo body 坐标系
+  ignition::math::Vector3d F_gazebo_body(F_mat.Y(), F_mat.X(), -F_mat.Z());
+  ignition::math::Vector3d M_gazebo_body(M_mat.Y(), M_mat.X(), -M_mat.Z());
   
   
   // ================= 施加力与力矩到 base_link =================
 
   if (base_link_) {
-    base_link_->AddRelativeForce(F_enu);    // 相对机体坐标系施加合力
-    base_link_->AddRelativeTorque(M_enu);   // 相对机体坐标系施加合力矩
+    base_link_->AddRelativeForce(F_gazebo_body);    // 相对机体坐标系施加合力
+    base_link_->AddRelativeTorque(M_gazebo_body);   // 相对机体坐标系施加合力矩
   }
   
   // ================= 速度控制（设定关节速度） =================
@@ -474,7 +615,7 @@ void DuctedFanModel::UpdateForcesAndMoments() {
   // ================= 调试打印部分 =========================
   // 使用 static 保证变量在多次调用中保持值，用于记录上次打印时间
   // DEBUG_PRINT 可以手动控制是否启用调试打印
-  const bool DEBUG_PRINT = true; // 手动控制
+  const bool DEBUG_PRINT = false; // 手动控制
   if (DEBUG_PRINT){
     static std::chrono::steady_clock::time_point last_print_time = std::chrono::steady_clock::now();
     auto current_time = std::chrono::steady_clock::now();
@@ -495,8 +636,15 @@ void DuctedFanModel::UpdateForcesAndMoments() {
           << "Ve: " << Ve << " m/s\n"
           << "p_mat:" << p_mat << " q_mat:" << q_mat << " r_mat:" << r_mat << "\n"
           << "M_my:" << M_my << " M_fan:" << M_fan << " M_sta:" << M_sta << "\n"
-          << "M_total(enu): " << M_enu << "\n"
-          << "F_enu: " << F_enu << std::endl;
+          << "M_cs: "<< M_cs(0) << " "<< M_cs(1) << " "<< M_cs(2) << "\n"
+          << "CS_gazebo(rad): "
+          << CS1_gazebo << " " << CS2_gazebo << " " << CS3_gazebo << " "
+          << CS4_gazebo << " " << CS5_gazebo << " " << CS6_gazebo << "\n"
+          << "CS_mat(rad): "
+          << CS1_mat << " " << CS2_mat << " " << CS3_mat << " "
+          << CS4_mat << " " << CS5_mat << " " << CS6_mat << "\n"      
+          << "M_total: " << M_gazebo_body << "\n"
+          << "F_gazebo_body: " << F_gazebo_body << std::endl;
         std::cout << "----------------------------------" << std::endl;
 
         // 更新时间戳

@@ -2,7 +2,7 @@
 #include <stdio.h>              // 标准输入输出（如 printf）
 
 #include <boost/bind.hpp>       // Boost 库的 bind 函数，用于创建回调函数绑定的参数占位符
-#include <Eigen/Eigen>          // Eigen 线性代数库，本文件中并未直接使用，但可能被包含的 motor_model 使用
+#include <Eigen/Dense>         // // Eigen 线性代数库，用于控制舵面分配矩阵
 #include <gazebo/gazebo.hh>     // Gazebo 通用头文件，提供核心功能
 #include <gazebo/physics/physics.hh> // Gazebo 物理引擎接口（关节、刚体等）
 #include <gazebo/common/common.hh>   // Gazebo 通用工具（如时间、PID、事件连接）
@@ -17,6 +17,7 @@
 
 #include "common.h"                   // 包含一些通用辅助函数，如 getSdfParam
 #include <vector>                     // C++ 标准库的 vector 容器
+#include <string>                     // C++ 标准库的 string 类     
 #include "ductedfan_plugin/spline_ppval.h" // 包含样条插值相关的定义和函数
 
 
@@ -83,7 +84,11 @@ class DuctedFanModel : public MotorModel, public ModelPlugin {
         rotor_velocity_slowdown_sim_(kDefaultRotorVelocitySlowdownSim), // 仿真中降低转速的因子（为减少仿真需求而人为减慢电机）
         time_constant_down_(kDefaultTimeConstantDown),  // 电机减速时间常数
         time_constant_up_(kDefaultTimeConstantUp),  // 电机加速时间常数（一阶滤波器）
-        reversible_(false) {        // 默认不可反转（推力方向只能为正）
+        reversible_(false), // 默认不可反转（推力方向只能为正）
+        control_joint_names_(kControlJointCount + 1),
+        control_joints_(kControlJointCount + 1),
+        control_joint_angles_(kControlJointCount + 1, 0.0),
+        B_cs_(Eigen::Matrix<double, 3, 6>::Zero()){        
   }
 
   virtual ~DuctedFanModel(); // 虚析构函数
@@ -164,6 +169,30 @@ class DuctedFanModel : public MotorModel, public ModelPlugin {
   std::vector<SplineSegment> wing_spline_wl_; // 机翼升力系数样条
   std::vector<SplineSegment> wing_spline_wd_; // 机翼侧向力系数样条
   std::vector<SplineSegment> wing_spline_wm_; // 机翼俯仰力矩系数样条
+
+
+  //控制舵面角度读取区
+  static const int kControlJointCount = 6;  // 控制舵面数量，编号为 1 到 6
+
+  std::vector<std::string> control_joint_names_; // 控制舵面关节名称，使用下标 1 到 6
+
+  std::vector<physics::JointPtr> control_joints_; // 控制舵面关节指针
+
+  std::vector<double> control_joint_angles_;  // 控制舵面当前转角，单位 rad
+
+  void LoadControlJoints(sdf::ElementPtr _sdf);  // 读取 SDF 中的控制舵面关节
+
+  void ReadControlJointAngles();                 // 读取当前控制舵面角度
+
+  void LoadControlEffectivenessMatrix(sdf::ElementPtr _sdf);  // 从 SDF 读取控制舵面分配矩阵
+
+  double d_cs_; // 单个控制舵面的力系数
+
+  double l1_cs_;  // 控制舵面力臂参数 l1
+
+  double l2_cs_;  // 控制舵面力臂参数 l2
+
+  Eigen::Matrix<double, 3, 6> B_cs_;            // 控制舵面分配矩阵，维度为 3 x 6
 
   // ---------- 通信与 Gazebo 对象 ----------
   transport::NodePtr node_handle_;        // Gazebo 通信节点
