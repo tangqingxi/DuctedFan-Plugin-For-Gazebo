@@ -1,5 +1,0 @@
-/home/antusheng/DuctedFanUAV-Autopilot/Tools/sitl_gazebo/src/liftdrag_plugin/liftdrag_plugin.cpp
-/home/antusheng/DuctedFanUAV-Autopilot/Tools/sitl_gazebo/include/liftdrag_plugin/liftdrag_plugin.h
-/home/antusheng/DuctedFanUAV-Autopilot/Tools/sitl_gazebo/CMakeLists.txt
-
-liftdrag_plugin.cpp 和 liftdrag_plugin.h 插件学习仿写。
